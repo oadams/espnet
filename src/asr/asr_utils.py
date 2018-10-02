@@ -54,7 +54,6 @@ def make_batchset(data, batch_size, max_length_in, max_length_out, num_batches=0
     if num_batches > 0:
         minibatch = minibatch[:num_batches]
     logging.info('# minibatches: ' + str(len(minibatch)))
-
     return minibatch
 
 
@@ -69,6 +68,10 @@ def load_inputs_and_targets(batch):
     """
     # load acoustic features and target sequence of token ids
     xs = [kaldi_io_py.read_mat(b[1]['input'][0]['feat']) for b in batch]
+    ivector_idx = [i for i, j in enumerate(b[1]['input']) if j['name'] == 'ivectors']
+    vs = None
+    if len(ivector_idx) > 0:
+        vs = [kaldi_io_py.read_mat(b[1]['input'][ivector_idx[0]]['feat']) for b in batch]
     ys = [b[1]['output'][0]['tokenid'].split() for b in batch]
 
     # get index of non-zero length samples
@@ -80,10 +83,12 @@ def load_inputs_and_targets(batch):
             len(xs), len(nonzero_sorted_idx)))
 
     # remove zero-length samples
+    if vs is not None:
+        vs = [vs[i] for i in nonzero_sorted_idx]
     xs = [xs[i] for i in nonzero_sorted_idx]
     ys = [np.fromiter(map(int, ys[i]), dtype=np.int64) for i in nonzero_sorted_idx]
 
-    return xs, ys
+    return xs, vs, ys
 
 
 # * -------------------- chainer extension related -------------------- *

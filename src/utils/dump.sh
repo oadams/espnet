@@ -11,6 +11,7 @@ nj=1
 verbose=0
 compress=true
 write_utt2num_frames=true
+ivectors=
 
 . utils/parse_options.sh
 
@@ -33,6 +34,9 @@ for n in $(seq $nj); do
     # the next command does nothing unless $dumpdir/storage/ exists, see
     # utils/create_data_link.pl for more info.
     utils/create_data_link.pl ${dumpdir}/feats.${n}.ark
+    if [ ! -z $ivectors ] && [ -f $ivectors ]; then
+        ./utils/create_data_link.pl ${dumpdir}/ivectors_online.${i}.ark
+    fi
 done
 
 if $write_utt2num_frames; then
@@ -43,32 +47,49 @@ fi
 
 # split scp file
 split_scps=""
+split_scps_ivector=""
 for n in $(seq $nj); do
     split_scps="$split_scps $logdir/feats.$n.scp"
+    split_scps_ivector="$split_scps_ivector $logdir/ivectors_online.$n.scp"
 done
 
 utils/split_scp.pl $scp $split_scps || exit 1;
+if [ ! -z $ivectors ] && [ -f $ivectors ]; then
+    utils/split_scp.pl $ivectors $split_scps_ivector || exit 1;
+fi
 
-# dump features
-if ${do_delta};then
-    $cmd JOB=1:$nj $logdir/dump_feature.JOB.log \
-        apply-cmvn --norm-vars=true $cvmnark scp:$logdir/feats.JOB.scp ark:- \| \
-        add-deltas ark:- ark:- \| \
-        copy-feats --compress=$compress --compression-method=2 ${write_num_frames_opt} \
-            ark:- ark,scp:${dumpdir}/feats.JOB.ark,${dumpdir}/feats.JOB.scp \
-        || exit 1
-else
-    $cmd JOB=1:$nj $logdir/dump_feature.JOB.log \
-        apply-cmvn --norm-vars=true $cvmnark scp:$logdir/feats.JOB.scp ark:- \| \
-        copy-feats --compress=$compress --compression-method=2 ${write_num_frames_opt} \
-            ark:- ark,scp:${dumpdir}/feats.JOB.ark,${dumpdir}/feats.JOB.scp \
+# Feature extraction
+feat_cmd=""
+
+# Only add cmvn is no ivectors are provided
+if [ -z $ivectors ]; then
+    feat_cmd="${feat_cmd} apply-cmvn --norm-vars=true $cmvnark ark:- ark:- \|"
+fi
+
+# Add deltas
+if ${do_delta}; then
+    feat_cmd="${feat_cmd} add-deltas ark:- ark:- \|"
+fi
+
+# Store outuot
+feat_cmd="${feat_cmd} copy-feats --compress=${compress} --compression-method=2 \
+  ${write_num_frames_opt} ark:- ark,scp:${dumpdir}/feats.JOB.ark,${dumpdir}/feats.JOB.scp"
+
+# Extract features
+$cmd JOB=1:${nj} ${logdir}/dump_feature.JOB.log \
+    copy-feats scp:${logdir}/feats.JOB.scp ark:- \| ${feat_cmd} || exit 1
+
+
+if [ ! -z $ivectors ] && [ -f $ivectors ]; then
+    $cmd JOB=1:$nj $logdir/dump_ivectors.JOB.log \
+        copy-feats --compress=$compress --compression-method=2 \
+            scp:$logdir/ivectors_online.JOB.scp ark,scp:${dumpdir}/ivectors_online.JOB.ark,${dumpdir}/ivectors_online.JOB.scp \
         || exit 1
 fi
 
 # concatenate scp files
-for n in $(seq $nj); do
-    cat $dumpdir/feats.$n.scp || exit 1;
-done > $dumpdir/feats.scp || exit 1
+cat ${dumpdir}/feats.*.scp > ${dumpdir}/feats.scp
+cat ${dumpdir}/ivectors_online.*.scp > ${dumpdir}/ivectors_online.scp
 
 if $write_utt2num_frames; then
     for n in $(seq $nj); do

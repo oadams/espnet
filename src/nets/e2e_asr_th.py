@@ -27,6 +27,7 @@ from ctc_prefix_score import CTCPrefixScore
 from e2e_asr_common import end_detect
 from e2e_asr_common import get_vgg2l_odim
 from e2e_asr_common import label_smoothing_dist
+#from KaldiTDNN import KaldiTDNN
 
 
 CTC_LOSS_THRESHOLD = 10000
@@ -132,7 +133,7 @@ class Loss(torch.nn.Module):
         self.predictor = predictor
         self.reporter = Reporter()
 
-    def forward(self, xs_pad, ilens, ys_pad):
+    def forward(self, xs_pad, ilens, ys_pad, ivectors=None):
         '''Multi-task learning loss forward
 
         :param torch.Tensor xs_pad: batch of padded input sequences (B, Tmax, idim)
@@ -142,7 +143,7 @@ class Loss(torch.nn.Module):
         :rtype: torch.Tensor
         '''
         self.loss = None
-        loss_ctc, loss_att, acc = self.predictor(xs_pad, ilens, ys_pad)
+        loss_ctc, loss_att, acc = self.predictor(xs_pad, ilens, ys_pad, ivectors)
         alpha = self.mtlalpha
         if alpha == 0:
             self.loss = loss_att
@@ -181,7 +182,7 @@ class E2E(torch.nn.Module):
         self.char_list = args.char_list
         self.outdir = args.outdir
         self.mtlalpha = args.mtlalpha
-
+        self.ivector_dim = args.ivector_dim
         # below means the last number becomes eos/sos ID
         # note that sos/eos IDs are identical
         self.sos = odim - 1
@@ -206,7 +207,12 @@ class E2E(torch.nn.Module):
             labeldist = label_smoothing_dist(odim, args.lsm_type, transcript=args.train_json)
         else:
             labeldist = None
-
+        
+        # ivector mixer
+        self.ivector_mixer = None
+        if self.ivector_dim:
+            self.ivector_mixer = IVector_Mixer(idim, self.ivector_dim, idim, kernel_size=3)
+             
         # encoder
         self.enc = Encoder(args.etype, idim, args.elayers, args.eunits, args.eprojs,
                            self.subsample, args.dropout_rate)
@@ -280,7 +286,7 @@ class E2E(torch.nn.Module):
                     n = data.size(1)
                     stdv = 1. / math.sqrt(n)
                     data.normal_(0, stdv)
-                elif data.dim() == 4:
+                elif data.dim() == 4 or data.dim() == 3:
                     # conv weight
                     n = data.size(1)
                     for k in data.size()[2:]:
@@ -304,7 +310,7 @@ class E2E(torch.nn.Module):
         for l in six.moves.range(len(self.dec.decoder)):
             set_forget_bias_to_one(self.dec.decoder[l].bias_ih)
 
-    def forward(self, xs_pad, ilens, ys_pad):
+    def forward(self, xs_pad, ilens, ys_pad, ivectors=None):
         '''E2E forward
 
         :param torch.Tensor xs_pad: batch of padded input sequences (B, Tmax, idim)
@@ -317,16 +323,20 @@ class E2E(torch.nn.Module):
         :return: accuracy in attention decoder
         :rtype: float
         '''
-        # 1. encoder
+        # 1. Ivector mixing?
+        if ivectors is not None:
+            xs_pad, ilens = self.ivector_mixer(xs_pad, ivectors, ilens) 
+
+        # 2. encoder
         hs_pad, hlens = self.enc(xs_pad, ilens)
 
-        # 2. CTC loss
+        # 3. CTC loss
         if self.mtlalpha == 0:
             loss_ctc = None
         else:
             loss_ctc = self.ctc(hs_pad, hlens, ys_pad)
 
-        # 3. attention loss
+        # 4. attention loss
         if self.mtlalpha == 1:
             loss_att = None
             acc = None
@@ -2047,6 +2057,8 @@ class Encoder(torch.nn.Module):
             self.enc2 = BLSTM(get_vgg2l_odim(idim, in_channel=in_channel),
                               elayers, eunits, eprojs, dropout)
             logging.info('Use CNN-VGG + BLSTM for encoder')
+        elif etype == 'kaldiTDNN':
+            self.enc1 = KaldiTDNN() 
         else:
             logging.error(
                 "Error: need to specify an appropriate encoder archtecture")
@@ -2136,6 +2148,33 @@ class BLSTMP(torch.nn.Module):
             xs_pad = torch.tanh(projected.view(ys_pad.size(0), ys_pad.size(1), -1))
 
         return xs_pad, ilens  # x: utt list of frame x dim
+
+
+class IVector_Mixer(torch.nn.Module):
+    """IVector_Mixer Module
+
+    This class is a simply convolution over the input features to which another
+    single element kernel convolution over the ivectors is added
+
+    """
+
+    def __init__(self, idim, ivector_dim, odim, kernel_size=3):
+        super(IVector_Mixer, self).__init__()
+        self.kernel_size = kernel_size
+        self.W = torch.nn.Conv1d(idim, odim, kernel_size, stride=1, dilation=1, bias=True, padding=1)
+        self.V = torch.nn.Conv1d(ivector_dim, odim, 1, stride=1, dilation=1, bias=False, padding=0) 
+
+    
+    def forward(self, xs_pad, ivectors, ilens):
+        xs_pad = xs_pad.transpose(1, 2)
+        ivectors = ivectors.transpose(1, 2)
+        xs_pad = self.W(xs_pad) + self.V(ivectors)
+        xs_pad = xs_pad.transpose(1, 2)
+        xs_pad = xs_pad.contiguous().view(
+            xs_pad.size(0), xs_pad.size(1), xs_pad.size(2))
+        xs_pad = [xs_pad[i, :ilens[i]] for i in range(len(ilens))]
+        xs_pad = pad_list(xs_pad, 0.0)
+        return xs_pad, ilens
 
 
 class BLSTM(torch.nn.Module):

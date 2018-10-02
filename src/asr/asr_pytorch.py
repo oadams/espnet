@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import pdb
 
 # chainer related
 import chainer
@@ -114,15 +115,21 @@ class CustomUpdater(training.StandardUpdater):
 
         # Get the next batch ( a list of json files)
         batch = train_iter.next()
-        x = self.converter(batch, self.device)
-
+        v = None
+        if self.model.predictor.ivector_dim:
+            xtmp = self.converter(batch, self.device, use_ivectors=True)
+            v = xtmp[3]
+            x = xtmp[:3]
+        else:
+            x = self.converter(batch, self.device, use_ivectors=False)
+    
         # Compute the loss at this time step and accumulate it
         optimizer.zero_grad()  # Clear the parameter gradients
         if self.ngpu > 1:
-            loss = 1. / self.ngpu * self.model(*x)
+            loss = 1. / self.ngpu * self.model(*x, ivectors=v)
             loss.backward(loss.new_ones(self.ngpu))  # Backprop
         else:
-            loss = self.model(*x)
+            loss = self.model(*x, ivectors=v)
             loss.backward()  # Backprop
         loss.detach()  # Truncate the graph
         # compute the gradient norm to check if it is normal or not
@@ -145,15 +152,15 @@ class CustomConverter(object):
     def transform(self, item):
         return load_inputs_and_targets(item)
 
-    def __call__(self, batch, device):
+    def __call__(self, batch, device, use_ivectors=False):
         # batch should be located in list
         assert len(batch) == 1
-        xs, ys = batch[0]
-
-        # perform subsamping
+        xs, vs, ys = batch[0]
+        
         if self.subsamping_factor > 1:
             xs = [x[::self.subsampling_factor, :] for x in xs]
-
+            if use_ivectors:
+                vs = [v[::self.subsampling_factor, :] for v in vs]
         # get batch of lengths of input sequences
         ilens = np.array([x.shape[0] for x in xs])
 
@@ -161,6 +168,10 @@ class CustomConverter(object):
         xs_pad = pad_list([torch.from_numpy(x).float() for x in xs], 0).to(device)
         ilens = torch.from_numpy(ilens).to(device)
         ys_pad = pad_list([torch.from_numpy(y).long() for y in ys], self.ignore_id).to(device)
+
+        if use_ivectors:
+            vs_pad = pad_list([torch.from_numpy(v).float() for v in vs], 0).to(device)
+            return xs_pad, ilens, ys_pad, vs_pad
 
         return xs_pad, ilens, ys_pad
 
@@ -196,6 +207,12 @@ def train(args):
     odim = int(valid_json[utts[0]]['output'][0]['shape'][1])
     logging.info('#input dims : ' + str(idim))
     logging.info('#output dims: ' + str(odim))
+
+    # get optional ivector input dimension here
+    inputs = [i['name'] for i in valid_json[utts[0]]['input']]
+    args.ivector_dim = None
+    if 'ivectors' in inputs:
+        args.ivector_dim = [int(i['shape'][1]) for i in valid_json[utts[0]]['input'] if i['name'] == 'ivectors'][0]
 
     # specify attention, CTC, hybrid mode
     if args.mtlalpha == 1.0:

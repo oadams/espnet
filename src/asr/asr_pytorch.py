@@ -122,7 +122,7 @@ class CustomUpdater(training.StandardUpdater):
             x = xtmp[:3]
         else:
             x = self.converter(batch, self.device, use_ivectors=False)
-    
+   
         # Compute the loss at this time step and accumulate it
         optimizer.zero_grad()  # Clear the parameter gradients
         if self.ngpu > 1:

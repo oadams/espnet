@@ -27,7 +27,6 @@ from ctc_prefix_score import CTCPrefixScore
 from e2e_asr_common import end_detect
 from e2e_asr_common import get_vgg2l_odim
 from e2e_asr_common import label_smoothing_dist
-#from KaldiTDNN import KaldiTDNN
 
 
 CTC_LOSS_THRESHOLD = 10000
@@ -143,7 +142,7 @@ class Loss(torch.nn.Module):
         :rtype: torch.Tensor
         '''
         self.loss = None
-        loss_ctc, loss_att, acc = self.predictor(xs_pad, ilens, ys_pad, ivectors)
+        loss_ctc, loss_att, acc = self.predictor(xs_pad, ilens, ys_pad, ivectors=ivectors)
         alpha = self.mtlalpha
         if alpha == 0:
             self.loss = loss_att
@@ -207,15 +206,10 @@ class E2E(torch.nn.Module):
             labeldist = label_smoothing_dist(odim, args.lsm_type, transcript=args.train_json)
         else:
             labeldist = None
-        
-        # ivector mixer
-        self.ivector_mixer = None
-        if self.ivector_dim:
-            self.ivector_mixer = IVector_Mixer(idim, self.ivector_dim, idim, kernel_size=3)
-             
+            
         # encoder
         self.enc = Encoder(args.etype, idim, args.elayers, args.eunits, args.eprojs,
-                           self.subsample, args.dropout_rate)
+                           self.subsample, args.dropout_rate, ivector_dim=self.ivector_dim)
         # ctc
         self.ctc = CTC(odim, args.eprojs, args.dropout_rate)
         # attention
@@ -323,12 +317,8 @@ class E2E(torch.nn.Module):
         :return: accuracy in attention decoder
         :rtype: float
         '''
-        # 1. Ivector mixing?
-        if ivectors is not None:
-            xs_pad, ilens = self.ivector_mixer(xs_pad, ivectors, ilens) 
-
-        # 2. encoder
-        hs_pad, hlens = self.enc(xs_pad, ilens)
+        
+        hs_pad, hlens = self.enc(xs_pad, ilens, ivectors=ivectors)
 
         # 3. CTC loss
         if self.mtlalpha == 0:
@@ -2036,8 +2026,13 @@ class Encoder(torch.nn.Module):
     :param int in_channel: number of input channels
     '''
 
-    def __init__(self, etype, idim, elayers, eunits, eprojs, subsample, dropout, in_channel=1):
+    def __init__(self, etype, idim, elayers, eunits, eprojs, subsample, dropout, in_channel=1, ivector_dim=None):
         super(Encoder, self).__init__()
+
+        if ivector_dim is not None:
+            lda_dim = idim * 3 + ivector_dim
+            self.ivector_mixer = IVector_Mixer(idim, ivector_dim, lda_dim, kernel_size=3)
+            idim = lda_dim
 
         if etype == 'blstm':
             self.enc1 = BLSTM(idim, elayers, eunits, eprojs, dropout)
@@ -2057,8 +2052,16 @@ class Encoder(torch.nn.Module):
             self.enc2 = BLSTM(get_vgg2l_odim(idim, in_channel=in_channel),
                               elayers, eunits, eprojs, dropout)
             logging.info('Use CNN-VGG + BLSTM for encoder')
-        elif etype == 'kaldiTDNN':
-            self.enc1 = KaldiTDNN() 
+        elif etype == 'tdnn':
+            if ivector_dim:
+                self.enc1 = TDNN(idim, ivector_dim=ivector_dim)
+            else:
+                # Change offsets to account for lack of first layer convolution
+                # when not using ivectors
+                offsets = [ (-1, 0, 1), (-1, 0, 1), (-1, 0, 1),
+                            (-3, 0, 3), (-3, 0, 3), (-3, 0, 3), (-3, 0, 3)
+                ]
+                self.enc1 = TDNN(idim, ivector_dim=ivector_dim, offsets=offsets)
         else:
             logging.error(
                 "Error: need to specify an appropriate encoder archtecture")
@@ -2066,7 +2069,7 @@ class Encoder(torch.nn.Module):
 
         self.etype = etype
 
-    def forward(self, xs_pad, ilens):
+    def forward(self, xs_pad, ilens, ivectors=None):
         '''Encoder forward
 
         :param torch.Tensor xs_pad: batch of padded input sequences (B, Tmax, D)
@@ -2074,6 +2077,11 @@ class Encoder(torch.nn.Module):
         :return: batch of hidden state sequences (B, Tmax, erojs)
         :rtype: torch.Tensor
         '''
+        # First mix in ivectors
+        if ivectors is not None:
+            xs_pad, ilens = self.ivector_mixer(xs_pad, ivectors, ilens) 
+
+        # Proceed as normal
         if self.etype == 'blstm':
             xs_pad, ilens = self.enc1(xs_pad, ilens)
         elif self.etype == 'blstmp':
@@ -2084,6 +2092,8 @@ class Encoder(torch.nn.Module):
         elif self.etype == 'vggblstm':
             xs_pad, ilens = self.enc1(xs_pad, ilens)
             xs_pad, ilens = self.enc2(xs_pad, ilens)
+        elif self.etype == 'tdnn':
+            xs_pad, ilens = self.enc1(xs_pad, ilens)
         else:
             logging.error(
                 "Error: need to specify an appropriate encoder archtecture")
@@ -2169,6 +2179,64 @@ class IVector_Mixer(torch.nn.Module):
         xs_pad = xs_pad.transpose(1, 2)
         ivectors = ivectors.transpose(1, 2)
         xs_pad = self.W(xs_pad) + self.V(ivectors)
+        xs_pad = xs_pad.transpose(1, 2)
+        xs_pad = xs_pad.contiguous().view(
+            xs_pad.size(0), xs_pad.size(1), xs_pad.size(2))
+        xs_pad = [xs_pad[i, :ilens[i]] for i in range(len(ilens))]
+        xs_pad = pad_list(xs_pad, 0.0)
+        return xs_pad, ilens
+
+
+class TDNN(torch.nn.Module):
+    '''
+        Kaldi TDNN style encoder implemented as convolutions
+    '''
+    def __init__(self, idim, odims=[625, 625, 625, 625, 625, 625, 625, 625, 3000],
+                             offsets=[(0,), (-1, 0, 1), (-1, 0, 1), (-3, 0, 3), (-3, 0, 3), (-3, 0, 3), (-3, 0, 3)],
+                             dropout=0.1, ivector_dim=None, lda_kernel_size=3):
+        super(TDNN, self).__init__()
+        
+        # Proper TDNN layers
+        odims.insert(0, idim)
+        self.tdnn = []
+        self.batchnorm = []
+        i = 0
+        for offs in offsets:
+            # Calculate dilations
+            if len(offs) > 1:
+                dilations = np.diff(offs)
+                if np.all(dilations == dilations[0]):
+                    dil = dilations[0]
+                    pad = max(offs)
+                else:
+                    sys.exit("Not non-uniform offsets not implemented")
+            else:
+                dil = 1
+                pad = 0
+            
+            self.tdnn.append(torch.nn.Conv1d(odims[i], odims[i+1], len(offs), stride=1, dilation=dil, padding=pad))
+            self.batchnorm.append(torch.nn.BatchNorm1d(odims[i+1], eps=1e-03, affine=False))
+            i += 1
+
+        # Last few layers
+        self.prefinal_affine = torch.nn.Conv1d(odims[i], odims[i+1], 1, stride=1, dilation=1, bias=True, padding=0)
+        self.batchnorm.append(torch.nn.BatchNorm1d(odims[i+1], eps=1e-03, affine=False))
+        self.final_affine = torch.nn.Conv1d(odims[i+1], odims[i+2], 1, stride=3, dilation=1, bias=True, padding=0)
+
+    def forward(self, xs_pad, ilens):
+        xs_pad = xs_pad.transpose(1, 2)
+            
+        for tdnn, batchnorm in zip(self.tdnn, self.batchnorm[:-1]):
+            xs_pad = F.relu(tdnn(xs_pad))
+            xs_pad = batchnorm(xs_pad)
+        
+        xs_pad = F.relu(self.prefinal_affine(xs_pad))
+        xs_pad = self.batchnorm[-1](xs_pad)
+        xs_pad = self.final_affine(xs_pad)
+       
+        ilens = np.array(
+            np.ceil(np.array(ilens, dtype=np.float32) / 3), dtype=np.int64).tolist()
+  
         xs_pad = xs_pad.transpose(1, 2)
         xs_pad = xs_pad.contiguous().view(
             xs_pad.size(0), xs_pad.size(1), xs_pad.size(2))

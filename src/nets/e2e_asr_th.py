@@ -158,7 +158,7 @@ class Loss(torch.nn.Module):
             self.log_softmax = torch.nn.LogSoftmax(dim=1)
             self.loss_lang = torch.nn.NLLLoss()
 
-    def forward_langid(self, xs_pad, ilens, lang_ys):
+    def forward_langid(self, xs_pad, ilens, lang_ys, ivectors=None):
 
         hpad, hlens = self.predictor.encode(xs_pad, ilens)
         mean = hpad.mean(dim=1)
@@ -187,7 +187,7 @@ class Loss(torch.nn.Module):
 
         return self.loss_lang_out
 
-    def forward(self, xs_pad, ilens, ys_pad, phoneme_ys_pad):
+    def forward(self, xs_pad, ilens, ys_pad, phoneme_ys_pad, ivectors=None):
         '''Multi-task learning loss forward
 
         :param torch.Tensor xs_pad: batch of padded input sequences (B, Tmax, idim)
@@ -200,7 +200,7 @@ class Loss(torch.nn.Module):
 
         self.loss = None
         loss_ctc, loss_att, loss_phn, acc = self.predictor(
-                xs_pad, ilens, ys_pad, phoneme_ys_pad)
+                xs_pad, ilens, ys_pad, phoneme_ys_pad, ivectors=ivectors)
         alpha = self.mtlalpha
         beta = self.phoneme_objective_weight
 
@@ -258,6 +258,8 @@ class E2E(torch.nn.Module):
             # phoneme_objective_layers were an option
             self.phoneme_objective_layer = None
 
+        self.ivector_dim = args.ivector_dim
+
         # below means the last number becomes eos/sos ID
         # note that sos/eos IDs are identical
         self.sos = odim - 1
@@ -285,7 +287,8 @@ class E2E(torch.nn.Module):
         # encoder
         self.enc = Encoder(args.etype, idim, args.elayers, args.eunits, args.eprojs,
                            self.subsample, args.dropout_rate,
-                           phoneme_objective_layer=self.phoneme_objective_layer)
+                           phoneme_objective_layer=self.phoneme_objective_layer,
+                           ivector_dim=self.ivector_dim)
         # ctc
         self.ctc = CTC(odim, args.eprojs, args.dropout_rate)
         # Phoneme CTC objective
@@ -362,7 +365,7 @@ class E2E(torch.nn.Module):
                     n = data.size(1)
                     stdv = 1. / math.sqrt(n)
                     data.normal_(0, stdv)
-                elif data.dim() == 4:
+                elif data.dim() == 4 or data.dim() == 3:
                     # conv weight
                     n = data.size(1)
                     for k in data.size()[2:]:
@@ -386,7 +389,7 @@ class E2E(torch.nn.Module):
         for l in six.moves.range(len(self.dec.decoder)):
             set_forget_bias_to_one(self.dec.decoder[l].bias_ih)
 
-    def forward(self, xs_pad, ilens, ys_pad, phoneme_ys_pad):
+    def forward(self, xs_pad, ilens, ys_pad, phoneme_ys_pad, ivectors=None):
         '''E2E forward
 
         :param torch.Tensor xs_pad: batch of padded input sequences (B, Tmax, idim)
@@ -403,15 +406,15 @@ class E2E(torch.nn.Module):
         logging.info("E2E forward phoneme_ys_pad: {}".format(phoneme_ys_pad))
 
         # 1. encoder
-        hs_pad, hlens = self.encode(xs_pad, ilens)
+        hs_pad, hlens = self.encode(xs_pad, ilens, ivectors=ivectors)
 
-        # 2. CTC loss
+        # 3. CTC loss
         if self.mtlalpha == 0:
             loss_ctc = None
         else:
             loss_ctc = self.ctc(hs_pad, hlens, ys_pad)
 
-        # 3. attention loss
+        # 4. attention loss
         if self.mtlalpha == 1:
             loss_att = None
             acc = None
@@ -435,10 +438,10 @@ class E2E(torch.nn.Module):
 
         return loss_ctc, loss_att, loss_phn, acc
 
-    def encode(self, xs_pad, ilens):
+    def encode(self, xs_pad, ilens, ivectors=None):
         """ Takes the JSON data (which is a batch) and then produces an encodedv version"""
 
-        hs_pad, hlens = self.enc(xs_pad, ilens)
+        hs_pad, hlens = self.enc(xs_pad, ilens, ivectors=ivectors)
         return hs_pad, hlens
 
     def recognize_phn(self, x):
@@ -2302,8 +2305,13 @@ class Encoder(torch.nn.Module):
 
     def __init__(self, etype, idim, elayers, eunits, eprojs, subsample,
                  dropout, in_channel=1,
-                 phoneme_objective_layer=None):
+                 phoneme_objective_layer=None, ivector_dim=None):
         super(Encoder, self).__init__()
+
+        if ivector_dim is not None:
+            lda_dim = idim * 3 + ivector_dim
+            self.ivector_mixer = IVector_Mixer(idim, ivector_dim, lda_dim, kernel_size=3)
+            idim = lda_dim
 
         if etype == 'blstm':
             self.enc1 = BLSTM(idim, elayers, eunits, eprojs, dropout)
@@ -2325,6 +2333,16 @@ class Encoder(torch.nn.Module):
             self.enc2 = BLSTM(get_vgg2l_odim(idim, in_channel=in_channel),
                               elayers, eunits, eprojs, dropout)
             logging.info('Use CNN-VGG + BLSTM for encoder')
+        elif etype == 'tdnn':
+            if ivector_dim:
+                self.enc1 = TDNN(idim, ivector_dim=ivector_dim)
+            else:
+                # Change offsets to account for lack of first layer convolution
+                # when not using ivectors
+                offsets = [ (-1, 0, 1), (-1, 0, 1), (-1, 0, 1),
+                            (-3, 0, 3), (-3, 0, 3), (-3, 0, 3), (-3, 0, 3)
+                ]
+                self.enc1 = TDNN(idim, ivector_dim=ivector_dim, offsets=offsets)
         else:
             logging.error(
                 "Error: need to specify an appropriate encoder archtecture")
@@ -2332,7 +2350,7 @@ class Encoder(torch.nn.Module):
 
         self.etype = etype
 
-    def forward(self, xs_pad, ilens):
+    def forward(self, xs_pad, ilens, ivectors=None):
         '''Encoder forward
 
         :param torch.Tensor xs_pad: batch of padded input sequences (B, Tmax, D)
@@ -2340,6 +2358,11 @@ class Encoder(torch.nn.Module):
         :return: batch of hidden state sequences (B, Tmax, erojs)
         :rtype: torch.Tensor
         '''
+        # First mix in ivectors
+        if ivectors is not None:
+            xs_pad, ilens = self.ivector_mixer(xs_pad, ivectors, ilens) 
+
+        # Proceed as normal
         if self.etype == 'blstm':
             xs_pad, ilens = self.enc1(xs_pad, ilens)
         elif self.etype == 'blstmp':
@@ -2350,6 +2373,8 @@ class Encoder(torch.nn.Module):
         elif self.etype == 'vggblstm':
             xs_pad, ilens = self.enc1(xs_pad, ilens)
             xs_pad, ilens = self.enc2(xs_pad, ilens)
+        elif self.etype == 'tdnn':
+            xs_pad, ilens = self.enc1(xs_pad, ilens)
         else:
             logging.error(
                 "Error: need to specify an appropriate encoder archtecture")
@@ -2424,6 +2449,92 @@ class BLSTMP(torch.nn.Module):
                 logging.info("layer " + str(layer) + " != " + str(self.phoneme_objective_layer) + ". Not stashing hpad.")
 
         return xs_pad, ilens  # x: utt list of frame x dim
+
+
+class IVector_Mixer(torch.nn.Module):
+    """IVector_Mixer Module
+
+    This class is a simply convolution over the input features to which another
+    single element kernel convolution over the ivectors is added
+
+    """
+
+    def __init__(self, idim, ivector_dim, odim, kernel_size=3):
+        super(IVector_Mixer, self).__init__()
+        self.kernel_size = kernel_size
+        self.W = torch.nn.Conv1d(idim, odim, kernel_size, stride=1, dilation=1, bias=True, padding=1)
+        self.V = torch.nn.Conv1d(ivector_dim, odim, 1, stride=1, dilation=1, bias=False, padding=0) 
+
+    
+    def forward(self, xs_pad, ivectors, ilens):
+        xs_pad = xs_pad.transpose(1, 2)
+        ivectors = ivectors.transpose(1, 2)
+        xs_pad = self.W(xs_pad) + self.V(ivectors)
+        xs_pad = xs_pad.transpose(1, 2)
+        xs_pad = xs_pad.contiguous().view(
+            xs_pad.size(0), xs_pad.size(1), xs_pad.size(2))
+        xs_pad = [xs_pad[i, :ilens[i]] for i in range(len(ilens))]
+        xs_pad = pad_list(xs_pad, 0.0)
+        return xs_pad, ilens
+
+
+class TDNN(torch.nn.Module):
+    '''
+        Kaldi TDNN style encoder implemented as convolutions
+    '''
+    def __init__(self, idim, odims=[625, 625, 625, 625, 625, 625, 625, 625, 3000],
+                             offsets=[(0,), (-1, 0, 1), (-1, 0, 1), (-3, 0, 3), (-3, 0, 3), (-3, 0, 3), (-3, 0, 3)],
+                             dropout=0.1, ivector_dim=None, lda_kernel_size=3):
+        super(TDNN, self).__init__()
+        
+        # Proper TDNN layers
+        odims.insert(0, idim)
+        self.tdnn = []
+        self.batchnorm = []
+        i = 0
+        for offs in offsets:
+            # Calculate dilations
+            if len(offs) > 1:
+                dilations = np.diff(offs)
+                if np.all(dilations == dilations[0]):
+                    dil = dilations[0]
+                    pad = max(offs)
+                else:
+                    sys.exit("Not non-uniform offsets not implemented")
+            else:
+                dil = 1
+                pad = 0
+            
+            self.tdnn.append(torch.nn.Conv1d(odims[i], odims[i+1], len(offs), stride=1, dilation=dil, padding=pad))
+            self.batchnorm.append(torch.nn.BatchNorm1d(odims[i+1], eps=1e-03, affine=False))
+            i += 1
+
+        # Last few layers
+        self.prefinal_affine = torch.nn.Conv1d(odims[i], odims[i+1], 1, stride=1, dilation=1, bias=True, padding=0)
+        self.batchnorm.append(torch.nn.BatchNorm1d(odims[i+1], eps=1e-03, affine=False))
+        self.final_affine = torch.nn.Conv1d(odims[i+1], odims[i+2], 1, stride=3, dilation=1, bias=True, padding=0)
+
+    def forward(self, xs_pad, ilens):
+        xs_pad = xs_pad.transpose(1, 2)
+            
+        for tdnn, batchnorm in zip(self.tdnn, self.batchnorm[:-1]):
+            xs_pad = F.relu(tdnn(xs_pad))
+            xs_pad = batchnorm(xs_pad)
+        
+        xs_pad = F.relu(self.prefinal_affine(xs_pad))
+        xs_pad = self.batchnorm[-1](xs_pad)
+        xs_pad = self.final_affine(xs_pad)
+       
+        ilens = np.array(
+            np.ceil(np.array(ilens, dtype=np.float32) / 3), dtype=np.int64).tolist()
+  
+        xs_pad = xs_pad.transpose(1, 2)
+        xs_pad = xs_pad.contiguous().view(
+            xs_pad.size(0), xs_pad.size(1), xs_pad.size(2))
+        xs_pad = [xs_pad[i, :ilens[i]] for i in range(len(ilens))]
+        xs_pad = pad_list(xs_pad, 0.0)
+        return xs_pad, ilens
+
 
 class BLSTM(torch.nn.Module):
     """Bidirectional LSTM module

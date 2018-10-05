@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import pdb
 
 # chainer related
 import chainer
@@ -57,29 +58,29 @@ REPORT_INTERVAL = 100
 class CustomEvaluator(extensions.Evaluator):
     '''Custom evaluater for pytorch'''
 
-    def __init__(self, model, iterator, target, converter, device):
-        super(CustomEvaluator, self).__init__(iterator, target)
-        self.model = model
-        self.converter = converter
-        self.device = device
+       def __init__(self, model, iterator, target, converter, device):
+           super(CustomEvaluator, self).__init__(iterator, target)
+           self.model = model
+           self.converter = converter
+           self.device = device
 
-    # The core part of the update routine can be customized by overriding.
-    def evaluate(self):
-        iterator = self._iterators['main']
+# The core part of the update routine can be customized by overriding.
+           def evaluate(self):
+               iterator = self._iterators['main']
 
-        if self.eval_hook:
-            self.eval_hook(self)
+               if self.eval_hook:
+self.eval_hook(self)
 
-        if hasattr(iterator, 'reset'):
-            iterator.reset()
-            it = iterator
+    if hasattr(iterator, 'reset'):
+        iterator.reset()
+        it = iterator
         else:
-            it = copy.copy(iterator)
+        it = copy.copy(iterator)
 
         summary = reporter_module.DictSummary()
 
-        self.model.eval()
-        with torch.no_grad():
+self.model.eval()
+    with torch.no_grad():
             for batch in it:
                 observation = {}
                 with reporter_module.report_scope(observation):
@@ -139,16 +140,20 @@ class CustomUpdater(training.StandardUpdater):
 
         # Get the next batch ( a list of json files)
         batch = train_iter.next()
-        xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad, lang_ys = self.converter(batch, self.device)
+        if self.model.predictor.ivector_dim:
+            xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad, lang_ys, ivectors = self.converter(batch, self.device, use_ivectors=True)
+        else:
+            xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad, lang_ys = self.converter(batch, self.device, use_ivectors=False)
 
         # Compute the loss at this time step and accumulate it
         optimizer.zero_grad()  # Clear the parameter gradients
         if self.ngpu > 1:
             loss = 1. / self.ngpu * self.model(xs_pad, ilens, grapheme_ys_pad,
-                                               phoneme_ys_pad)
+                                               phoneme_ys_pad, ivectors=ivectors)
             loss.backward(loss.new_ones(self.ngpu))  # Backprop
         else:
-            loss = self.model(xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad)
+            loss = self.model(xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad,
+                              ivectors=ivectors)
             loss.backward()  # Backprop
         loss.detach()  # Truncate the graph
         # compute the gradient norm to check if it is normal or not
@@ -224,15 +229,16 @@ class CustomConverter(object):
                 item, self.phoneme_objective_weight,
                 self.lang2id)
 
-    def __call__(self, batch, device):
+    def __call__(self, batch, device, use_ivectors=False):
         # batch should be located in list
         assert len(batch) == 1
-        xs, grapheme_ys, phoneme_ys, lang_ys = batch[0]
+        xs, grapheme_ys, phoneme_ys, lang_ys, ivectors = batch[0]
 
         # perform subsamping
         if self.subsamping_factor > 1:
             xs = [x[::self.subsampling_factor, :] for x in xs]
-
+            if use_ivectors:
+                ivectors = [v[::self.subsampling_factor, :] for v in ivectors]
         # get batch of lengths of input sequences
         ilens = np.array([x.shape[0] for x in xs])
 
@@ -249,6 +255,10 @@ class CustomConverter(object):
 
 
         lang_ys = torch.from_numpy(lang_ys).long().to(device)
+
+        if use_ivectors:
+            vs_pad = pad_list([torch.from_numpy(v).float() for v in ivectors], 0).to(device)
+            return xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad, lang_ys, vs_pad
 
         return xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad, lang_ys
 
@@ -336,6 +346,12 @@ def train(args):
     if args.phoneme_objective_weight > 0.0:
         phoneme_odim = get_odim("phn", valid_json)
         logging.info('#phoneme output dims: ' + str(phoneme_odim))
+
+    # get optional ivector input dimension here
+    inputs = [i['name'] for i in valid_json[utts[0]]['input']]
+    args.ivector_dim = None
+    if 'ivectors' in inputs:
+        args.ivector_dim = [int(i['shape'][1]) for i in valid_json[utts[0]]['input'] if i['name'] == 'ivectors'][0]
 
     # specify attention, CTC, hybrid mode
     if args.mtlalpha == 1.0:

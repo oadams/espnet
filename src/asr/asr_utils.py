@@ -95,6 +95,10 @@ def load_inputs_and_targets(batch, phoneme_objective_weight, lang2id):
     # load acoustic features and target sequence of token ids
     xs = [kaldi_io_py.read_mat(b[1]['input'][0]['feat']) for b in batch]
     grapheme_ys = [get_output("grapheme", b[1]) for b in batch]
+    ivector_idx = [i for i, j in enumerate(b[1]['input']) if j['name'] == 'ivectors']
+    ivectors = None
+    if len(ivector_idx) > 0:
+        ivectors = [kaldi_io_py.read_mat(b[1]['input'][ivector_idx[0]]['feat']) for b in batch]
 
     # get index of non-zero length samples
     nonzero_idx = filter(lambda i: len(grapheme_ys[i]) > 0, range(len(xs)))
@@ -105,6 +109,8 @@ def load_inputs_and_targets(batch, phoneme_objective_weight, lang2id):
             len(xs), len(nonzero_sorted_idx)))
 
     # remove zero-length samples
+    if vs is not None:
+        vs = [vs[i] for i in nonzero_sorted_idx]
     xs = [xs[i] for i in nonzero_sorted_idx]
     grapheme_ys = [np.fromiter(map(int, grapheme_ys[i]), dtype=np.int64) for i in nonzero_sorted_idx]
 
@@ -123,7 +129,7 @@ def load_inputs_and_targets(batch, phoneme_objective_weight, lang2id):
                           dtype=np.int64)
     logging.info("lang_ys: {}".format(lang_ys))
 
-    return xs, grapheme_ys, phoneme_ys, lang_ys
+    return xs, grapheme_ys, phoneme_ys, lang_ys, ivectors
 
 # * -------------------- chainer extension related -------------------- *
 class CompareValueTrigger(object):
@@ -193,7 +199,7 @@ class PlotAttentionReport(extension.Extension):
             os.makedirs(self.outdir)
 
     def __call__(self, trainer):
-        xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad, lang_ys = self.converter([self.converter.transform(self.data)], self.device)
+        xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad, lang_ys, ivectors = self.converter([self.converter.transform(self.data)], self.device)
         att_ws = self.att_vis_fn(xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad)
         for idx, att_w in enumerate(att_ws):
             filename = "%s/%s.ep.{.updater.epoch}.png" % (

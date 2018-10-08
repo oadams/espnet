@@ -246,7 +246,7 @@ def train(args):
     # specify model architecture
     e2e = E2E(idim, odim, args)
 
-    if args.kaldi_mdl != '':
+    if args.kaldi_mdl != '' and args.etype == 'tdnn':
         kaldi_net = import_kaldi(args.kaldi_mdl)
         e2e.init_kaldi(kaldi_net)
     

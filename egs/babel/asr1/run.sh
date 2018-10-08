@@ -27,6 +27,13 @@ elayers=6
 eunits=320
 eprojs=320
 subsample=1_2_2_1_1 # skip every n frame from input to nth layers
+
+tdnn_offsets="0 -1,0,1 -1,0,1 -3,0,3 -3,0,3 -3,0,3 -3,0,3"
+tdnn_odims="625 625 625 625 625 625 625"
+tdnn_prefinal_affine_dim=625
+tdnn_final_affine_dim=3000
+kaldi_mdl='text_8k.mdl'
+
 # decoder related
 dlayers=1
 dunits=300
@@ -96,6 +103,15 @@ set -o pipefail
 train_set=train
 train_dev=dev
 
+tdnn_odims_array=( ${tdnn_odims} )
+tdnn_offsets_array=( ${tdnn_offsets} )
+
+if [ ${#tdnn_odims_array[@]} -ne ${#tdnn_offsets_array[@]} ]; then
+  echo "tdnn_odims_array and tdnn_offsets_array must have the same number of elements"
+  exit 1
+fi
+
+
 # LM Directories
 if [ -z ${lmtag} ]; then
     lmtag=${lm_layers}layer_unit${lm_units}_${lm_opt}_bs${lm_batchsize}
@@ -112,7 +128,7 @@ recog_set=${recog_set%% }
 
 if [ $stage -le 0 ]; then
   echo "stage 0: Setting up individual languages"
-  ./local/setup_languages.sh --langs "${langs}" --recog "${recog}" --FLP false
+  ./local/setup_languages.sh --langs "${langs}" --recog "${recog}" --FLP true
   if $upsample; then
       for x in ${train_set} ${train_dev} ${recog_set}; do
 	        sed -i.bak -e "s/$/ sox -R -t wav - -t wav - rate 16000 dither | /" data/${x}/wav.scp
@@ -129,7 +145,7 @@ if [ $stage -le 1 ]; then
   # Generate the fbank features
   for x in ${train_set} ${train_dev} ${recog_set}; do
       steps/make_mfcc_pitch_online.sh --cmd "$train_cmd" \
-                                      --mfcc-config conf/mfcc_hires.conf --nj 20 \
+                                      --mfcc-config conf/mfcc_hires.conf --nj 40 \
                                       data/${x} exp/make_mfcc_pitch_online/${x} ${mfccdir}
       
       steps/compute_cmvn_stats.sh data/${x}
@@ -196,22 +212,24 @@ if [ ${stage} -le 2 ]; then
     | sort | uniq | grep -v -e '^\s*$' | grep -v '<unk>' | awk '{print $0 " " NR+1}' >> ${dict}
     wc -l ${dict}
     
+    ivector_opts=
+    if $use_ivectors; then
+      ivector_opts="--ivectors ${feat_tr_dir}/ivectors_online.scp"
+    fi
+    
     echo "make json files"
-    mkjson.py --non-lang-syms ${nlsyms} \
-              --ivectors ${feat_tr_dir}/ivectors_online.scp \
+    mkjson.py --non-lang-syms ${nlsyms} ${ivector_opts} \
               ${feat_tr_dir}/feats.scp data/${train_set} ${dict} \
               > ${feat_tr_dir}/data.json
 
     
-    mkjson.py --non-lang-syms ${nlsyms} \
-              --ivectors ${feat_dt_dir}/ivectors_online.scp \
+    mkjson.py --non-lang-syms ${nlsyms} ${ivector_opts} \
               ${feat_dt_dir}/feats.scp data/${train_dev} ${dict} \
               > ${feat_dt_dir}/data.json
 
     for rtask in ${recog_set}; do
         feat_recog_dir=${dumpdir}/${rtask}/delta${do_delta}
-        mkjson.py --non-lang-syms ${nlsyms} \
-              --ivectors ${feat_recog_dir}/ivectors_online.scp \
+        mkjson.py --non-lang-syms ${nlsyms} ${ivector_opts} \
               ${feat_recog_dir}/feats.scp data/${rtask} ${dict} \
               > ${feat_recog_dir}/data.json
     done
@@ -290,6 +308,11 @@ if [ ${stage} -le 3 ]; then
         --eunits ${eunits} \
         --eprojs ${eprojs} \
         --subsample ${subsample} \
+        --tdnn-offsets "${tdnn_offsets}" \
+        --tdnn-odims "${tdnn_odims}" \
+        --tdnn-prefinal-affine-dim ${tdnn_prefinal_affine_dim} \
+        --tdnn-final-affine-dim ${tdnn_final_affine_dim} \
+        --kaldi-mdl ${kaldi_mdl} \
         --dlayers ${dlayers} \
         --dunits ${dunits} \
         --atype ${atype} \
@@ -311,7 +334,7 @@ fi
 
 if [ ${stage} -le 4 ]; then
     echo "stage 4: Decoding"
-    nj=32
+    nj=64
 
     extra_opts=""
     if $use_lm; then

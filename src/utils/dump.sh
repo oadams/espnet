@@ -62,7 +62,7 @@ fi
 feat_cmd="copy-feats scp:${logdir}/feats.JOB.scp ark:- |"
 
 # Only add cmvn is no ivectors are provided
-if [ -z $ivectors ]; then
+if [ -z $ivectors ] && [ -f $ivectors ]; then
     echo "HERE"
     feat_cmd="${feat_cmd} apply-cmvn --norm-vars=true $cmvnark ark:- ark:- |"
 fi

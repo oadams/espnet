@@ -16,7 +16,7 @@ ivectors=
 . utils/parse_options.sh
 
 scp=$1
-cvmnark=$2
+cmvnark=$2
 logdir=$3
 dumpdir=$4
 
@@ -59,37 +59,37 @@ if [ ! -z $ivectors ] && [ -f $ivectors ]; then
 fi
 
 # Feature extraction
-feat_cmd=""
+feat_cmd="copy-feats scp:${logdir}/feats.JOB.scp ark:- |"
 
 # Only add cmvn is no ivectors are provided
 if [ -z $ivectors ]; then
-    feat_cmd="${feat_cmd} apply-cmvn --norm-vars=true $cmvnark ark:- ark:- \|"
+    echo "HERE"
+    feat_cmd="${feat_cmd} apply-cmvn --norm-vars=true $cmvnark ark:- ark:- |"
 fi
 
 # Add deltas
 if ${do_delta}; then
-    feat_cmd="${feat_cmd} add-deltas ark:- ark:- \|"
+    feat_cmd="${feat_cmd} add-deltas ark:- ark:- |"
 fi
 
-# Store outuot
-feat_cmd="${feat_cmd} copy-feats --compress=${compress} --compression-method=2 \
-  ${write_num_frames_opt} ark:- ark,scp:${dumpdir}/feats.JOB.ark,${dumpdir}/feats.JOB.scp"
+# Store output
+feat_cmd="${feat_cmd} copy-feats --compress=${compress} --compression-method=2 ${write_num_frames_opt} ark:- ark,scp:${dumpdir}/feats.JOB.ark,${dumpdir}/feats.JOB.scp"
 
 # Extract features
 $cmd JOB=1:${nj} ${logdir}/dump_feature.JOB.log \
-    copy-feats scp:${logdir}/feats.JOB.scp ark:- \| ${feat_cmd} || exit 1
-
+  ${feat_cmd} || exit 1
 
 if [ ! -z $ivectors ] && [ -f $ivectors ]; then
     $cmd JOB=1:$nj $logdir/dump_ivectors.JOB.log \
         copy-feats --compress=$compress --compression-method=2 \
             scp:$logdir/ivectors_online.JOB.scp ark,scp:${dumpdir}/ivectors_online.JOB.ark,${dumpdir}/ivectors_online.JOB.scp \
         || exit 1
+
+    cat ${dumpdir}/ivectors_online.*.scp > ${dumpdir}/ivectors_online.scp
 fi
 
 # concatenate scp files
 cat ${dumpdir}/feats.*.scp > ${dumpdir}/feats.scp
-cat ${dumpdir}/ivectors_online.*.scp > ${dumpdir}/ivectors_online.scp
 
 if $write_utt2num_frames; then
     for n in $(seq $nj); do

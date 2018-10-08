@@ -13,6 +13,7 @@ import os
 import subprocess
 import json
 from collections import defaultdict
+import re
 
 
 def parse_input():
@@ -80,9 +81,10 @@ def main():
     
     # Read in non-lang-symbols
     non_lang_symbols = set()
-    with codecs.open(args.non_lang_syms, 'r', encoding='utf-8') as f: 
-        for l in f:
-            non_lang_symbols.add(l.strip())
+    if args.non_lang_syms:
+        with codecs.open(args.non_lang_syms, 'r', encoding='utf-8') as f: 
+            for l in f:
+                non_lang_symbols.add(l.strip())
 
     # Read in utt2spk
     utt2spk = {}
@@ -111,14 +113,14 @@ def main():
     
     # Read in (optional) ivectors
     if args.ivectors:
-         ivector_scp = {}
-         with open(args.ivectors) as f:
+        ivector_scp = {}
+        with open(args.ivectors) as f:
             for l in f:
                 utt, ivector_path = l.strip().split(None, 1)
                 ivector_scp[utt] = ivector_path
 
-    # Get ivector dim
-    ivector_dim = int(subprocess.Popen(['feat-to-dim', 'scp:' + args.ivectors, '-'],
+        # Get ivector dim
+        ivector_dim = int(subprocess.Popen(['feat-to-dim', 'scp:' + args.ivectors, '-'],
                                 stdout=subprocess.PIPE).communicate()[0])
 
     
@@ -139,6 +141,10 @@ def main():
                     tokenid.extend([str(symbols[g]) for g in w])
                 token += " <space> "
                 tokenid.append(str(symbols['<space>']))
+            
+            # Strip trailing space
+            token = token.strip(" <space> ")
+            tokenid.pop()
             
             # input info
             inputs = [

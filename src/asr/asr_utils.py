@@ -9,6 +9,8 @@ import logging
 import os
 import shutil
 import tempfile
+import re
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -157,10 +159,22 @@ class PlotAttentionReport(extension.Extension):
         self.reverse = reverse
         if not os.path.exists(self.outdir):
             os.makedirs(self.outdir)
+        
+        self.use_ivectors = False
+        if 'ivectors' in [i['name'] for i in self.data[0][1]['input']]:
+            self.use_ivectors = True
 
     def __call__(self, trainer):
-        batch = self.converter([self.converter.transform(self.data)], self.device)
-        att_ws = self.att_vis_fn(*batch)
+        v = None
+        if self.use_ivectors:
+            xtmp = self.converter([self.converter.transform(self.data)], self.device, use_ivectors=True)
+            v = xtmp[3]
+            batch = xtmp[:3]
+        else:
+            batch = self.converter([self.converter.transform(self.data)], self.device, use_ivectors=False)
+
+        #batch = self.converter([self.converter.transform(self.data)], self.device, use_ivectors=self.use_ivectors)
+        att_ws = self.att_vis_fn(*batch, ivectors=v)
         for idx, att_w in enumerate(att_ws):
             filename = "%s/%s.ep.{.updater.epoch}.png" % (
                 self.outdir, self.data[idx][0])
@@ -273,6 +287,161 @@ def _torch_snapshot_object(trainer, target, filename, savefun):
         shutil.move(tmppath, os.path.join(trainer.out, fn))
     finally:
         shutil.rmtree(tmpdir)
+
+
+def import_kaldi(mdl):
+    '''
+        Read the model file, mdl. Store the model in net
+        Inputs:
+            mdl -- the text model output by nnet3-copy --binary=false final.mdl mdl
+        Returns:
+            net
+    '''
+    net = {}
+    # Read model file
+    f_mdl = open(mdl)
+    f = f_mdl.readlines()
+    f_mdl.close()
+    
+    # Some regex expressions we need
+    append_parse = re.compile(r'\(.+\)(\s|$)')
+    input_parse = re.compile(r'[^ ,\(]+\([^\)]+\)|[^ ,]+')
+    offset_parse = re.compile(r'\(([^,]+), ([^\)]+)\)')
+    dim_parse = re.compile(r'<Dim> (?P<dim>[0-9]+)')
+    dropout_parse = re.compile(r'<DropoutProportion> (?P<p>[0-9\.]+)')
+    batchnorm_parse = re.compile(r'\[(?P<vals>[ \.0-9e\-]+)\]')
+    line_parse = re.compile(r'(?P<node_type>[^ ]+-node)|name=(?P<name>[^ ]+)|dim=(?P<dim>[^ ]+)|component=(?P<component>[^ ]+)|input=(?P<input>[^ ,]+|Append\(.+\))(\s|$)|objective=(?P<objective>[^ ]+)(\s|$)')
+    line_parse_indexgroup = {i: v for v, i in line_parse.groupindex.iteritems()}
+
+    # Read the "graph" part
+    i = 0
+    while i < len(f):
+        if f[i].strip() == '':
+            i += 1
+            break;
+        if f[i].strip() == '<Nnet3>':
+            net['Nnet3'] = {}
+            net['Nnet3']['graph'] = [[],]
+            i += 1
+            continue;
+
+        line_vals = line_parse.findall(f[i].strip())
+        line_dict = {}
+        for lv in line_vals:
+            for iv, v in enumerate(lv):
+                if v.strip() != '':
+                    line_dict[line_parse_indexgroup[iv+1]] = v
+
+        
+        if line_dict['node_type'] == 'input-node':
+            net['Nnet3']['graph'][0].append(line_dict['name'])
+            try:
+                net['Nnet3']['inputs'][line_dict['name']] = int(line_dict['dim'])
+            except KeyError:
+                net['Nnet3']['inputs'] = {line_dict['name']: int(line_dict['dim'])}
+        elif line_dict['node_type'] == 'component-node':
+            net['Nnet3']['graph'].append(line_dict['name'])
+            
+            ################# Handle the inputs ###########################
+            input_type = line_dict['input']
+            inputs_string = append_parse.search(input_type)
+            inputs = defaultdict(list)
+            if inputs_string is not None:
+                inputs_string = inputs_string.group()[1:-1]
+                for inp in input_parse.findall(inputs_string):
+                    if inp.startswith("Offset"):
+                        offset_input = offset_parse.findall(inp)
+                        inputs[offset_input[0][0]].append(int(offset_input[0][1]))
+                    else:
+                        inputs[inp].append(0) 
+            else:
+                inputs[input_type].append(0)
+            ###############################################################
+            try:
+                net['Nnet3']['components'][line_dict['name']] = {
+                        'component': line_dict['component'],
+                        'input': inputs
+                    }
+            except KeyError:
+                net['Nnet3']['components'] = { line_dict['name']: {
+                            'component': line_dict['component'],
+                            'input': inputs
+                        }
+                    }
+        elif line_dict['node_type'] == "output-node":
+            pass
+
+        i += 1
+
+    # This is hacky and many parts are hard-coded but will do for now ...
+    while i < len(f):
+        # Get component name
+        if f[i].startswith('<ComponentName>'):
+            name = f[i].strip().split()[1]
+        
+        # Get the number of components
+        if f[i].strip().startswith("<NumComponents>"):
+            net['Nnet3']['NumComponents'] = int(f[i].strip().split()[1])
+        
+        # Get the LDA component <FixedAffineComponent>
+        elif f[i].startswith('<ComponentName>') and "<FixedAffineComponent>" in f[i]:
+            i += 1
+            lin_mat = []
+            while not f[i].strip().endswith(']'):
+                lin_mat.append([float(v) for v in f[i].strip().split()])
+                i += 1
+            lin_mat.append([float(v) for v in f[i].strip().strip(' ]').split()])
+            i += 1
+            bias_mat = [float(v) for v in f[i].strip().strip(' ]').split()[2:]]
+            net['Nnet3']['components'][name]['LinearParams'] = np.array(lin_mat)
+            net['Nnet3']['components'][name]['BiasParams'] = np.array(bias_mat)
+            net['Nnet3']['components'][name]['idim'] = len(lin_mat[0])
+            net['Nnet3']['components'][name]['odim'] = len(bias_mat)
+        
+        # Get the matrix for the <NaturalGradientAffineComponent>
+        elif f[i].startswith('<ComponentName>') and "<NaturalGradientAffineComponent>" in f[i]:
+            i += 1
+            lin_mat = []
+            while not f[i].strip().endswith(']'):
+                lin_mat.append([float(v) for v in f[i].strip().split()])
+                i += 1
+
+            lin_mat.append([float(v) for v in f[i].strip().strip(' ]').split()])
+            i += 1
+            bias_mat = [float(v) for v in f[i].strip().strip(' ]').split()[2:]]
+            net['Nnet3']['components'][name]['LinearParams'] = np.array(lin_mat)
+            net['Nnet3']['components'][name]['BiasParams'] = np.array(bias_mat)
+            net['Nnet3']['components'][name]['idim'] = net['Nnet3']['components'][name]['LinearParams'].shape[1]
+            net['Nnet3']['components'][name]['odim'] = net['Nnet3']['components'][name]['LinearParams'].shape[0]
+        
+        # For ReLUs, Batchnorm, LogSoftmax
+        elif f[i].startswith('<ComponentName>') and "<RectifiedLinearComponent>" in f[i] or "<LogSoftmaxComponent>" in f[i]:
+            dim = int(dim_parse.search(f[i].strip()).groupdict()['dim'])
+            net['Nnet3']['components'][name]['idim'] = dim
+            net['Nnet3']['components'][name]['odim'] = dim
+       
+        elif f[i].startswith('<ComponentName>') and "<BatchNormComponent>" in f[i]:
+            dim = int(dim_parse.search(f[i].strip()).groupdict()['dim'])
+            net['Nnet3']['components'][name]['idim'] = dim
+            net['Nnet3']['components'][name]['odim'] = dim
+            mu = np.array([float(v) for v in batchnorm_parse.search(f[i].strip()).groupdict()['vals'].strip().split()])
+            var = np.array([float(v) for v in batchnorm_parse.search(f[i+1].strip()).groupdict()['vals'].strip().split()])
+            net['Nnet3']['components'][name]['running_mean'] = mu 
+            net['Nnet3']['components'][name]['running_var'] = var
+
+        
+        # For Dropout
+        elif f[i].startswith('<ComponentName>') and "<GeneralDropoutComponent>" in f[i]:
+            dim = int(dim_parse.search(f[i].strip()).groupdict()['dim'])
+            p = float(dropout_parse.search(f[i].strip()).groupdict()['p'])
+            net['Nnet3']['components'][name]['idim'] = dim
+            net['Nnet3']['components'][name]['odim'] = dim
+            net['Nnet3']['components'][name]['p'] = p
+            
+        i += 1
+
+
+    return net
 
 
 # * -------------------- general -------------------- *
@@ -401,6 +570,7 @@ def torch_resume(snapshot_path, trainer):
 
     # delete opened snapshot
     del snapshot_dict
+
 
 
 # * ------------------ recognition related ------------------ *

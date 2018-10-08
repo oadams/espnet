@@ -9,7 +9,6 @@ import json
 import logging
 import math
 import os
-import pdb
 
 # chainer related
 import chainer
@@ -35,6 +34,7 @@ from asr_utils import torch_load
 from asr_utils import torch_resume
 from asr_utils import torch_save
 from asr_utils import torch_snapshot
+from asr_utils import import_kaldi
 from e2e_asr_th import E2E
 from e2e_asr_th import Loss
 from e2e_asr_th import pad_list
@@ -86,8 +86,15 @@ class CustomEvaluator(extensions.Evaluator):
                     # read scp files
                     # x: original json with loaded features
                     #    will be converted to chainer variable later
-                    x = self.converter(batch, self.device)
-                    self.model(*x)
+                    # x = self.converter(batch, self.device)
+                    v = None
+                    if self.model.predictor.ivector_dim:
+                        xtmp = self.converter(batch, self.device, use_ivectors=True)
+                        v = xtmp[3]
+                        x = xtmp[:3]
+                    else:
+                        x = self.converter(batch, self.device, use_ivectors=False)
+                    self.model(*x, ivectors=v)
                 summary.add(observation)
         self.model.train()
 
@@ -122,7 +129,7 @@ class CustomUpdater(training.StandardUpdater):
             x = xtmp[:3]
         else:
             x = self.converter(batch, self.device, use_ivectors=False)
-   
+             
         # Compute the loss at this time step and accumulate it
         optimizer.zero_grad()  # Clear the parameter gradients
         if self.ngpu > 1:
@@ -213,6 +220,17 @@ def train(args):
     args.ivector_dim = None
     if 'ivectors' in inputs:
         args.ivector_dim = [int(i['shape'][1]) for i in valid_json[utts[0]]['input'] if i['name'] == 'ivectors'][0]
+    
+    if args.tdnn_offsets != '':
+        args.tdnn_offsets = [[int(o) for o in l.split(',')] for l in args.tdnn_offsets.split()]
+
+
+    if args.tdnn_odims != '':
+        args.tdnn_odims = [int(d) for d in args.tdnn_odims.split()]
+    
+    if len(args.tdnn_odims) != len(args.tdnn_offsets):
+        sys.exit("Arguments are not right")
+
 
     # specify attention, CTC, hybrid mode
     if args.mtlalpha == 1.0:
@@ -223,10 +241,15 @@ def train(args):
         logging.info('Pure attention mode')
     else:
         mtl_mode = 'mtl'
-        logging.info('Multitask learning mode')
+        logging.info('Multitask learning model')
 
     # specify model architecture
     e2e = E2E(idim, odim, args)
+
+    if args.kaldi_mdl != '':
+        kaldi_net = import_kaldi(args.kaldi_mdl)
+        e2e.init_kaldi(kaldi_net)
+    
     model = Loss(e2e, args.mtlalpha)
 
     # write model config
@@ -423,7 +446,14 @@ def recog(args):
         for idx, name in enumerate(js.keys(), 1):
             logging.info('(%d/%d) decoding ' + name, idx, len(js.keys()))
             feat = kaldi_io_py.read_mat(js[name]['input'][0]['feat'])
-            nbest_hyps = e2e.recognize(feat, args, train_args.char_list, rnnlm)
+           
+            # Ivector stuff
+            v = None 
+            ivector_idx = [i for i, j in enumerate(js[js.keys()[0]]['input']) if j['name'] == 'ivectors']
+            if len(ivector_idx) > 0:
+                v = kaldi_io_py.read_mat(js[name]['input'][ivector_idx[0]]['feat'])
+
+            nbest_hyps = e2e.recognize(feat, args, train_args.char_list, rnnlm, ivectors=v)
             new_js[name] = add_results_to_json(js[name], nbest_hyps, train_args.char_list)
 
     # TODO(watanabe) fix character coding problems when saving it

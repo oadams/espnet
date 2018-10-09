@@ -9,7 +9,6 @@ import json
 import logging
 import math
 import os
-import pdb
 
 # chainer related
 import chainer
@@ -36,6 +35,7 @@ from asr_utils import torch_resume
 from asr_utils import torch_save
 from asr_utils import torch_snapshot
 from asr_utils import uttid2lang
+from asr_utils import import_kaldi
 from e2e_asr_th import E2E
 from e2e_asr_th import Loss
 from e2e_asr_th import pad_list
@@ -58,37 +58,41 @@ REPORT_INTERVAL = 100
 class CustomEvaluator(extensions.Evaluator):
     '''Custom evaluater for pytorch'''
 
-       def __init__(self, model, iterator, target, converter, device):
-           super(CustomEvaluator, self).__init__(iterator, target)
-           self.model = model
-           self.converter = converter
-           self.device = device
+    def __init__(self, model, iterator, target, converter, device):
+        super(CustomEvaluator, self).__init__(iterator, target)
+        self.model = model
+        self.converter = converter
+        self.device = device
 
-# The core part of the update routine can be customized by overriding.
-           def evaluate(self):
-               iterator = self._iterators['main']
+    # The core part of the update routine can be customized by overriding.
+    def evaluate(self):
+        iterator = self._iterators['main']
 
-               if self.eval_hook:
-self.eval_hook(self)
+        if self.eval_hook:
+            self.eval_hook(self)
 
-    if hasattr(iterator, 'reset'):
-        iterator.reset()
-        it = iterator
+        if hasattr(iterator, 'reset'):
+            iterator.reset()
+            it = iterator
         else:
-        it = copy.copy(iterator)
+            it = copy.copy(iterator)
 
         summary = reporter_module.DictSummary()
 
-self.model.eval()
-    with torch.no_grad():
+        self.model.eval()
+        with torch.no_grad():
             for batch in it:
                 observation = {}
                 with reporter_module.report_scope(observation):
                     # read scp files
                     # x: original json with loaded features
                     #    will be converted to chainer variable later
-                    xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad, lang_ys = self.converter(batch, self.device)
-                    self.model(xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad)
+                    vs_pad = None
+                    if self.model.predictor.ivector_dim:
+                        xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad, lang_ys, vs_pad = self.converter(batch, self.device, use_ivectors=True)
+                    else:
+                        xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad, lang_ys = self.converter(batch, self.device, use_ivectors=False)
+                    self.model(xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad, ivectors=vs_pad)
                 summary.add(observation)
         self.model.train()
 
@@ -144,6 +148,7 @@ class CustomUpdater(training.StandardUpdater):
             xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad, lang_ys, ivectors = self.converter(batch, self.device, use_ivectors=True)
         else:
             xs_pad, ilens, grapheme_ys_pad, phoneme_ys_pad, lang_ys = self.converter(batch, self.device, use_ivectors=False)
+            ivectors = None
 
         # Compute the loss at this time step and accumulate it
         optimizer.zero_grad()  # Clear the parameter gradients
@@ -353,6 +358,16 @@ def train(args):
     if 'ivectors' in inputs:
         args.ivector_dim = [int(i['shape'][1]) for i in valid_json[utts[0]]['input'] if i['name'] == 'ivectors'][0]
 
+    if args.tdnn_offsets != '':
+        args.tdnn_offsets = [[int(o) for o in l.split(',')] for l in args.tdnn_offsets.split()]
+
+    if args.tdnn_odims != '':
+        args.tdnn_odims = [int(d) for d in args.tdnn_odims.split()]
+
+    if len(args.tdnn_odims) != len(args.tdnn_offsets):
+        sys.exit("Length of tdnn_odim and tdnn_offset arguments are not equal")
+
+
     # specify attention, CTC, hybrid mode
     if args.mtlalpha == 1.0:
         mtl_mode = 'ctc'
@@ -371,7 +386,12 @@ def train(args):
         e2e = E2E(idim, grapheme_odim, args, phoneme_odim=phoneme_odim)
     else:
         e2e = E2E(idim, grapheme_odim, args)
-    model = Loss(e2e, args.mtlalpha, 
+
+    if args.kaldi_mdl != '' and args.etype == 'tdnn':
+        kaldi_net = import_kaldi(args.kaldi_mdl)
+        e2e.init_kaldi(kaldi_net)
+
+    model = Loss(e2e, args.mtlalpha,
                  phoneme_objective_weight=args.phoneme_objective_weight,
                  langs=langs)
 
@@ -599,7 +619,14 @@ def recog(args):
         for idx, name in enumerate(js.keys(), 1):
             logging.info('(%d/%d) decoding ' + name, idx, len(js.keys()))
             feat = kaldi_io_py.read_mat(js[name]['input'][0]['feat'])
-            nbest_hyps = e2e.recognize(feat, args, train_args.char_list, rnnlm)
+
+            # Ivector stuff
+            v = None
+            ivector_idx = [i for i, j in enumerate(js[js.keys()[0]]['input']) if j['name'] == 'ivectors']
+            if len(ivector_idx) > 0:
+                v = kaldi_io_py.read_mat(js[name]['input'][ivector_idx[0]]['feat'])
+
+            nbest_hyps = e2e.recognize(feat, args, train_args.char_list, rnnlm, ivectors=v)
             new_js[name] = add_results_to_json(js[name], nbest_hyps, train_args.char_list, "grapheme")
 
     if train_args.phoneme_objective_weight > 0:

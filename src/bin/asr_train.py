@@ -56,6 +56,20 @@ def main():
     parser.add_argument('--subsample', default=1, type=str,
                         help='Subsample input frames x_y_z means subsample every x frame at 1st layer, '
                              'every y frame at 2nd layer etc.')
+    # TDNN
+    parser.add_argument('--tdnn-odims', default='', type=str,
+                        action='store', required=False, help='specify the output dimension of each tdnn layer')
+    parser.add_argument('--tdnn-offsets', default='', type=str,
+                        action='store', required=False, help='specify the offsets for each layer in the tdnn')
+    parser.add_argument('--tdnn-prefinal-affine-dim', default=625, type=int,
+                        action='store', required=False,
+                        help='tdnn prefinal affine dimension')
+    parser.add_argument('--tdnn-final-affine-dim', default=3000, type=int,
+                        action='store', required=False,
+                        help='tdnn final affine dimension')
+    parser.add_argument('--kaldi-mdl', default='', type=str, action='store', 
+                        required=False, help='Kaldi nnet3 model file. Output of'
+                        ' nnet3-copy --binary=False final.mdl text_mdl.txt')
     # loss
     parser.add_argument('--ctc_type', default='warpctc', type=str,
                         choices=['chainer', 'warpctc'],

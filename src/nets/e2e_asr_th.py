@@ -264,6 +264,7 @@ class E2E(torch.nn.Module):
         # note that sos/eos IDs are identical
         self.sos = odim - 1
         self.eos = odim - 1
+        self.idim = idim
 
         # subsample info
         # +1 means input (+1) and layers outputs (args.elayer)
@@ -288,7 +289,11 @@ class E2E(torch.nn.Module):
         self.enc = Encoder(args.etype, idim, args.elayers, args.eunits, args.eprojs,
                            self.subsample, args.dropout_rate,
                            phoneme_objective_layer=self.phoneme_objective_layer,
-                           ivector_dim=self.ivector_dim)
+                           ivector_dim=self.ivector_dim,
+                           tdnn_odims=args.tdnn_odims,
+                           tdnn_offsets=args.tdnn_offsets,
+                           tdnn_prefinal_affine_dim=args.tdnn_prefinal_affine_dim,
+                           tdnn_final_affine_dim=args.tdnn_final_affine_dim)
         # ctc
         self.ctc = CTC(odim, args.eprojs, args.dropout_rate)
         # Phoneme CTC objective
@@ -343,6 +348,80 @@ class E2E(torch.nn.Module):
 
         # weight initialization
         self.init_like_chainer()
+
+    
+    def init_kaldi(self, net):
+        for c_name, c_comp in net['Nnet3']['components'].items():
+            idim = c_comp['idim']
+            odim = c_comp['odim']
+            #########################################
+            # LDA COMPONENT
+            #########################################
+            if c_name == 'lda':
+                for i in range(3):
+                    self.enc.ivector_mixer.W.weight.data[:, :, i] = torch.Tensor(c_comp['LinearParams'][:, i*self.idim:(i+1)*self.idim])
+                self.enc.ivector_mixer.W.bias.data = torch.Tensor(c_comp['BiasParams'])
+                #self.enc.ivector_mixer.W.weight.requires_grad = False
+                #self.enc.ivector_mixer.W.bias.requires_grad = False 
+                
+                # ivectors
+                if self.ivector_dim is not None:
+                    self.enc.ivector_mixer.V.weight.data[:, :, 0] = torch.Tensor(c_comp['LinearParams'][:, -self.ivector_dim:])
+                    #self.enc.ivector_mixer.V.weight.requires_grad = False 
+
+                
+            #########################################
+            # TDNN
+            #########################################
+            elif c_name.startswith('tdnn') and c_name.endswith('affine'):
+                if len(c_comp['input']) == 1:
+                    input_name, offsets = c_comp['input'].items()[0]
+                    
+                    kernel_size = len(offsets)
+                    # Check for equal spacing
+                    if kernel_size > 1:
+                        dilations = np.diff(offsets)
+                        if np.all(dilations == dilations[0]):
+                            dil = dilations[0]
+                        else:
+                            print("Not Implemented. We require constant TDNN offsets.")
+                    else:
+                        dil=1
+                else:
+                    print("Not Implemented")
+                    sys.exit()
+                
+                # Convert Matrix multiplication on appended inputs to convolution operation
+                frame_dim = idim // kernel_size
+                layer_num = int(c_name.split('.')[0][-1]) - 1 # This isn't great. SHOULD CHANGE!!
+
+                for i in range(kernel_size):
+                    self.enc.enc1.tdnn[layer_num].weight.data[:, :, i] = torch.Tensor(c_comp['LinearParams'][:, i*frame_dim:(i+1)*frame_dim])
+                
+                # Bias
+                self.enc.enc1.tdnn[layer_num].bias.data = torch.Tensor(c_comp['BiasParams'])
+
+            elif c_name.startswith('prefinal') and c_name.endswith('affine'):
+                self.enc.enc1.prefinal_affine.weight.data[:, :, 0] = torch.Tensor(c_comp['LinearParams'])
+                self.enc.enc1.prefinal_affine.bias.data = torch.Tensor(c_comp['BiasParams'])
+            elif c_name.startswith('output') and c_name.endswith('affine'):
+                self.enc.enc1.final_affine.weight.data[:, :, 0] = torch.Tensor(c_comp['LinearParams'])
+                self.enc.enc1.final_affine.bias.data = torch.Tensor(c_comp['BiasParams'])
+
+
+            #########################################
+            # BATCHNORM
+            #########################################
+            elif c_name.endswith('batchnorm'):
+                if c_name.startswith('prefinal-chain'):
+                    layer_num = -1
+                elif c_name.startswith('tdnn'):
+                    layer_num = int(c_name.split('.')[0][-1]) - 1 # This isn't great. SHOULD CHANGE!!
+                else:
+                    continue;
+                self.enc.enc1.batchnorm[layer_num].running_mean = torch.Tensor(c_comp['running_mean'])  
+                self.enc.enc1.batchnorm[layer_num].running_var = torch.Tensor(c_comp['running_var'])
+
 
     def init_like_chainer(self):
         """Initialize weight like chainer
@@ -473,7 +552,7 @@ class E2E(torch.nn.Module):
         return phn_hyp
 
     def recognize(self, x, recog_args, char_list,
-                  rnnlm=None):
+                  rnnlm=None, ivectors=None):
         '''E2E beam search
 
         :param ndarray x: input acouctic feature (T, D)
@@ -491,9 +570,15 @@ class E2E(torch.nn.Module):
         h = to_cuda(self, torch.from_numpy(
             np.array(x, dtype=np.float32)))
 
+        v = None
+        if ivectors is not None:
+            ivectors = ivectors[::self.subsample[0], :]
+            v = to_cuda(self, torch.from_numpy(np.array(ivectors, dtype=np.float32)))
+            v = v.unsqueeze(0)
+
         # 1. encoder
         # make a utt list (1) to use the same interface for encoder
-        h, _ = self.enc(h.unsqueeze(0), ilen)
+        h, _ = self.enc(h.unsqueeze(0), ilen, ivectors=v)
 
         # calculate log P(z_t|X) for CTC scores
         if recog_args.ctc_weight > 0.0:
@@ -532,7 +617,7 @@ class E2E(torch.nn.Module):
             self.train()
         return y
 
-    def calculate_all_attentions(self, xs_pad, ilens, ys_pad, _phoneme_ys_pad):
+    def calculate_all_attentions(self, xs_pad, ilens, ys_pad, _phoneme_ys_pad, ivectors=None):
         '''E2E attention calculation
 
         :param torch.Tensor xs_pad: batch of padded input sequences (B, Tmax, idim)
@@ -545,7 +630,7 @@ class E2E(torch.nn.Module):
         '''
         with torch.no_grad():
             # encoder
-            hpad, hlens = self.enc(xs_pad, ilens)
+            hpad, hlens = self.enc(xs_pad, ilens, ivectors=ivectors)
 
             # decoder
             att_ws = self.dec.calculate_all_attentions(hpad, hlens, ys_pad)
@@ -2305,7 +2390,9 @@ class Encoder(torch.nn.Module):
 
     def __init__(self, etype, idim, elayers, eunits, eprojs, subsample,
                  dropout, in_channel=1,
-                 phoneme_objective_layer=None, ivector_dim=None):
+                 phoneme_objective_layer=None, ivector_dim=None,
+                 tdnn_odims=None, tdnn_offsets=None,
+                 tdnn_prefinal_affine_dim=625, tdnn_final_affine_dim=3000):
         super(Encoder, self).__init__()
 
         if ivector_dim is not None:
@@ -2334,15 +2421,15 @@ class Encoder(torch.nn.Module):
                               elayers, eunits, eprojs, dropout)
             logging.info('Use CNN-VGG + BLSTM for encoder')
         elif etype == 'tdnn':
-            if ivector_dim:
-                self.enc1 = TDNN(idim, ivector_dim=ivector_dim)
+            if tdnn_offsets is not None and tdnn_odims is not None:
+                self.enc1 = TDNN(idim, eprojs,
+                                prefinal_affine_dim=tdnn_prefinal_affine_dim,
+                                final_affine_dim=tdnn_final_affine_dim,
+                                offsets=tdnn_offsets, odims=tdnn_odims)
             else:
-                # Change offsets to account for lack of first layer convolution
-                # when not using ivectors
-                offsets = [ (-1, 0, 1), (-1, 0, 1), (-1, 0, 1),
-                            (-3, 0, 3), (-3, 0, 3), (-3, 0, 3), (-3, 0, 3)
-                ]
-                self.enc1 = TDNN(idim, ivector_dim=ivector_dim, offsets=offsets)
+                self.enc1 = TDNN(idim, eprojs,
+                                 prefinal_affine_dim=tdnn_prefinal_affine_dim,
+                                 final_affine_dim=tdnn_final_affine_dim)
         else:
             logging.error(
                 "Error: need to specify an appropriate encoder archtecture")
@@ -2482,15 +2569,16 @@ class TDNN(torch.nn.Module):
     '''
         Kaldi TDNN style encoder implemented as convolutions
     '''
-    def __init__(self, idim, odims=[625, 625, 625, 625, 625, 625, 625, 625, 3000],
-                             offsets=[(0,), (-1, 0, 1), (-1, 0, 1), (-3, 0, 3), (-3, 0, 3), (-3, 0, 3), (-3, 0, 3)],
-                             dropout=0.1, ivector_dim=None, lda_kernel_size=3):
+    def __init__(self, idim, odim, odims=[625, 625, 625, 625, 625, 625, 625], prefinal_affine_dim=625, final_affine_dim=3000,
+                             offsets=[[0], [-1, 0, 1], [-1, 0, 1], [-3, 0, 3], [-3, 0, 3], [-3, 0, 3], [-3, 0, 3]],
+                             dropout=0.1):
         super(TDNN, self).__init__()
         
         # Proper TDNN layers
-        odims.insert(0, idim)
-        self.tdnn = []
-        self.batchnorm = []
+        odims_ = list(odims)
+        odims_.insert(0, idim)
+        self.tdnn = torch.nn.ModuleList()
+        self.batchnorm = torch.nn.ModuleList()
         i = 0
         for offs in offsets:
             # Calculate dilations
@@ -2505,18 +2593,19 @@ class TDNN(torch.nn.Module):
                 dil = 1
                 pad = 0
             
-            self.tdnn.append(torch.nn.Conv1d(odims[i], odims[i+1], len(offs), stride=1, dilation=dil, padding=pad))
-            self.batchnorm.append(torch.nn.BatchNorm1d(odims[i+1], eps=1e-03, affine=False))
+            self.tdnn.append(torch.nn.Conv1d(odims_[i], odims_[i+1], len(offs), stride=1, dilation=dil, padding=pad))
+            self.batchnorm.append(torch.nn.BatchNorm1d(odims_[i+1], eps=1e-03, affine=False))
             i += 1
 
         # Last few layers
-        self.prefinal_affine = torch.nn.Conv1d(odims[i], odims[i+1], 1, stride=1, dilation=1, bias=True, padding=0)
-        self.batchnorm.append(torch.nn.BatchNorm1d(odims[i+1], eps=1e-03, affine=False))
-        self.final_affine = torch.nn.Conv1d(odims[i+1], odims[i+2], 1, stride=3, dilation=1, bias=True, padding=0)
+        self.prefinal_affine = torch.nn.Conv1d(odims_[i], prefinal_affine_dim, 1, stride=1, dilation=1, bias=True, padding=0)
+        self.batchnorm.append(torch.nn.BatchNorm1d(prefinal_affine_dim, eps=1e-03, affine=False))
+        self.final_affine = torch.nn.Conv1d(prefinal_affine_dim, final_affine_dim, 1, stride=3, dilation=1, bias=True, padding=0)
+
+        self.conversion_affine = torch.nn.Conv1d(final_affine_dim, odim, 1, stride=1, dilation=1, bias=False, padding=0)
 
     def forward(self, xs_pad, ilens):
         xs_pad = xs_pad.transpose(1, 2)
-            
         for tdnn, batchnorm in zip(self.tdnn, self.batchnorm[:-1]):
             xs_pad = F.relu(tdnn(xs_pad))
             xs_pad = batchnorm(xs_pad)
@@ -2524,7 +2613,8 @@ class TDNN(torch.nn.Module):
         xs_pad = F.relu(self.prefinal_affine(xs_pad))
         xs_pad = self.batchnorm[-1](xs_pad)
         xs_pad = self.final_affine(xs_pad)
-       
+        xs_pad = self.conversion_affine(xs_pad)
+         
         ilens = np.array(
             np.ceil(np.array(ilens, dtype=np.float32) / 3), dtype=np.int64).tolist()
   
